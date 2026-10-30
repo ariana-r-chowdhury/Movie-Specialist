@@ -1,4 +1,4 @@
-import os
+import argparse
 import requests
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
@@ -12,16 +12,16 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 
 load_dotenv()
-print(os.getenv("OPENAI_API_KEY") is not None)
-print(find_dotenv())
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-line = ChatOpenAI(model="gpt-4o", temperature=0) #temperature = 0 means the LLm will try to follow our instructions as accurately as possible
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CHAT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 #database logic
 PERSIS_PATH = "./qdrant_db"
@@ -37,60 +37,80 @@ def load_script(url, movie_title):
     #create a langchain document based on it
     return Document(page_content=script_raw, metadata={"title": movie_title}) #the more metadata i.e. character name etc. provided the more intelligent the agent becomes
 
+def ingest_scripts():
+    pirates_of_the_caribbean_scripts = [
+        {
+            "title": "Pirates of the Caribbean: The Curse of Black Pearl",
+            "url": "https://imsdb.com/scripts/Pirates-of-the-Caribbean.html",
+        },
+        {
+            "title": "Pirates of the Caribbean: Dead Man's Chest",
+            "url": "https://imsdb.com/scripts/Pirates-of-the-Caribbean-Dead-Man's-Chest.html",
+        },
+        {
+            "title": "Pirates of the Caribbean: At World's End",
+            "url": "http://www.script-o-rama.com/movie_scripts/a2/pirates--of-the-caribbean-worlds-end-script.html",
+        },
+    ]
+    script_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2500,
+        chunk_overlap=250,
+        add_start_index=True,
+        separators=["\nINT.", "\nEXT.", "\n\n", "\n", " ", ""],
+    )
+    all_chunks = []
+    for script in pirates_of_the_caribbean_scripts:
+        doc = load_script(script["url"], script["title"])
+        chunks = script_splitter.split_documents([doc])
+        all_chunks.extend(chunks)
+        print(f"Loaded and split script for {script['title']} into {len(chunks)} chunks.")
+
+    QdrantVectorStore.from_documents(
+        all_chunks,
+        embedding=embeddings,
+        path=PERSIS_PATH,
+        collection_name=COLLECTION_NAME,
+    )
+    print(f"Embedded {len(all_chunks)} chunks with {EMBEDDING_MODEL} into {PERSIS_PATH}.")
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--reembed",
+        action="store_true",
+        help="Replace the local Qdrant collection and embed all scripts again.",
+    )
+    args = parser.parse_args()
     client = QdrantClient(path=PERSIS_PATH)
 
-    #if we indexed the collection we will initilize the vector store
-    try:
-        client.get_collection(collection_name=COLLECTION_NAME)
-        vectorstore = QdrantVectorStore(
-            collection_name=COLLECTION_NAME,
-            embedding=embeddings,
-            client=client,
-        )
-    except Exception:
+    if args.reembed:
+        if client.collection_exists(COLLECTION_NAME):
+            client.delete_collection(COLLECTION_NAME)
         client.close()
+        ingest_scripts()
+        return
 
-        pirates_of_the_caribbean_scripts = [
-                {
-                    "title": "Pirates of the Caribbean: The Curse of Black Pearl",
-                    "url": "https://imsdb.com/scripts/Pirates-of-the-Caribbean.html"
-                },
-                {
-                    "title": "Pirates of the Caribbean: Dead Man's Chest",
-                    "url": "https://imsdb.com/scripts/Pirates-of-the-Caribbean-Dead-Man's-Chest.html"
-                },
-                {
-                    "title": "Pirates of the Caribbean: At World's End",
-                    "url": "http://www.script-o-rama.com/movie_scripts/a2/pirates--of-the-caribbean-worlds-end-script.html"
-                },
-            ]
-        script_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2500, #splitting the text into chunks of 2500
-            chunk_overlap=250, #chunk overlap: to ensure ai does not miss anything 
-            add_start_index=True,
-            #split when langchain encounter INT or EXT. if the resulting chunk is still greater than 2500 chars, only then will it fall on \n\n or " \n
-            separators=["\nINT.", "\nEXT.", "\n\n", "\n", " ", ""],
-        )
-
-        all_chunks = []
-
-        for script in pirates_of_the_caribbean_scripts:
-            doc = load_script(script["url"], script["title"])
-            chunks = script_splitter.split_documents([doc])
-            all_chunks.extend(chunks)
-            print(
-                f"Loaded and split script for {script["title"]} into {len(chunks)} chunks."
-            )
-
-        vectorstore = QdrantVectorStore.from_documents(
-            all_chunks,
-            embedding=embeddings,
-            path=PERSIS_PATH,
-            collection_name=COLLECTION_NAME,
-        )
+    if not client.collection_exists(COLLECTION_NAME):
+        client.close()
+        ingest_scripts()
+        client = QdrantClient(path=PERSIS_PATH)
+    vectorstore = QdrantVectorStore(
+        collection_name=COLLECTION_NAME,
+        embedding=embeddings,
+        client=client,
+    )
+    # Both embeddings and chat run locally; Hugging Face downloads are free and
+    # do not require an API key. The first run downloads the chat model weights.
+    local_llm = HuggingFacePipeline.from_model_id(
+        model_id=CHAT_MODEL,
+        task="text-generation",
+        device=-1,
+        pipeline_kwargs={"max_new_tokens": 512, "do_sample": False},
+    )
+    line = ChatHuggingFace(llm=local_llm)
     #fetches the top 15 most relevant chunks from the vectorstore based on the query
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
     template = """
     You are a Pirates of the Caribbean Movie Scipt Expert. Use ONLY the following excerpts to answer.
